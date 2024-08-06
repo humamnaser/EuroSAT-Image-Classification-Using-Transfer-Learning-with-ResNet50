@@ -1,0 +1,334 @@
+import os
+import zipfile
+import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+import torchvision.transforms as transforms
+from PIL import Image
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import models
+import matplotlib.pyplot as plt
+import numpy as np
+import pickle
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
+import seaborn as sns
+import torchvision.utils as vutils
+from sklearn.metrics import classification_report
+from sklearn.manifold import TSNE
+import pandas as pd
+
+# Unzip dataset
+dataset_path = '/content/drive/MyDrive/datasets/EuroSAT.zip'
+extracted_path = '/content/drive/MyDrive/datasets/EuroSAT'
+if not os.path.exists(extracted_path):
+    os.makedirs(extracted_path)
+    with zipfile.ZipFile(dataset_path, 'r') as zip_ref:
+        zip_ref.extractall(extracted_path)
+
+# Directory paths
+dataset_dir = os.path.join(extracted_path, '2750')
+
+class EuroSATDataset(Dataset):
+    def __init__(self, dataset_dir, transform=None):
+        self.dataset_dir = dataset_dir
+        self.transform = transform
+        self.data = []
+        self.labels = []
+        self.class_names = os.listdir(dataset_dir)
+        self.class_to_idx = {class_name: idx for idx, class_name in enumerate(self.class_names)}
+
+        for class_name in self.class_names:
+            class_dir = os.path.join(dataset_dir, class_name)
+            for img_name in os.listdir(class_dir):
+                img_path = os.path.join(class_dir, img_name)
+                self.data.append(img_path)
+                self.labels.append(self.class_to_idx[class_name])
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img_path = self.data[idx]
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[idx]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+# Data preprocessing and augmentation
+initial_transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
+    transforms.RandomVerticalFlip(),
+    transforms.RandomResizedCrop(128, scale=(0.8, 1.0)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+dataset = EuroSATDataset(dataset_dir, transform=initial_transform)
+
+# Use a subset of 10,000 images
+subset_indices = torch.randperm(len(dataset))[:10000]
+subset_dataset = Subset(dataset, subset_indices)
+
+# Split dataset into training, validation, and test sets
+train_size = int(0.64 * len(subset_dataset))
+val_size = int(0.16 * len(subset_dataset))
+test_size = len(subset_dataset) - train_size - val_size
+
+train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(subset_dataset, [train_size, val_size, test_size])
+
+# Data loaders
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=4)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=4)
+
+print(f'Train dataset size: {len(train_dataset)}')
+print(f'Validation dataset size: {len(val_dataset)}')
+print(f'Test dataset size: {len(test_dataset)}')
+
+with open('/content/drive/MyDrive/datasets/eurosat_subset_indices.pkl', 'wb') as f:
+    pickle.dump(subset_indices, f)
+
+# Save the split datasets
+torch.save(train_dataset, '/content/drive/MyDrive/datasets/eurosat_train_dataset.pt')
+torch.save(val_dataset, '/content/drive/MyDrive/datasets/eurosat_val_dataset.pt')
+torch.save(test_dataset, '/content/drive/MyDrive/datasets/eurosat_test_dataset.pt')
+
+class TransferLearningResNet50(nn.Module):
+    def __init__(self, num_classes=10):
+        super(TransferLearningResNet50, self).__init__()
+        self.resnet50 = models.resnet50(pretrained=True)
+        # Freeze all layers
+        for param in self.resnet50.parameters():
+            param.requires_grad = False
+        # Replace the final fully connected layer
+        in_features = self.resnet50.fc.in_features
+        self.resnet50.fc = nn.Linear(in_features, num_classes)
+
+    def forward(self, x):
+        return self.resnet50(x)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = TransferLearningResNet50().to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+early_stopping_patience = 3
+
+epochs = 10
+best_val_loss = float('inf')
+early_stopping_counter = 0
+train_acc, val_acc = [], []
+train_loss, val_loss = [], []
+
+for epoch in range(epochs):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        _, predicted = torch.max(outputs, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+    epoch_loss = running_loss / len(train_loader.dataset)
+    epoch_acc = correct / total
+    train_loss.append(epoch_loss)
+    train_acc.append(epoch_acc)
+    print(f'Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}')
+
+    scheduler.step()
+
+    # Validation loop
+    model.eval()
+    val_loss_val = 0.0
+    val_correct = 0
+    val_total = 0
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            val_loss_val += loss.item() * inputs.size(0)
+            _, predicted = torch.max(outputs, 1)
+            val_total += labels.size(0)
+            val_correct += (predicted == labels).sum().item()
+
+    val_loss_val /= len(val_loader.dataset)
+    val_acc_val = val_correct / val_total
+    val_loss.append(val_loss_val)
+    val_acc.append(val_acc_val)
+    print(f'Validation Loss: {val_loss_val:.4f}, Accuracy: {val_acc_val:.4f}')
+
+    # Early stopping
+    if val_loss_val < best_val_loss:
+        best_val_loss = val_loss_val
+        torch.save(model.state_dict(), '/content/drive/MyDrive/datasets/simple_cnn_best_model.pth')
+        early_stopping_counter = 0
+    else:
+        early_stopping_counter += 1
+
+    if early_stopping_counter >= early_stopping_patience:
+        print("Early stopping triggered")
+        break
+
+model.load_state_dict(torch.load('/content/drive/MyDrive/datasets/simple_cnn_best_model.pth'))
+model.eval()
+test_loss = 0.0
+test_correct = 0
+test_total = 0
+all_preds = []
+all_labels = []
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        test_loss += loss.item() * inputs.size(0)
+        _, predicted = torch.max(outputs, 1)
+        test_total += labels.size(0)
+        test_correct += (predicted == labels).sum().item()
+        all_preds.extend(predicted.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+test_loss /= len(test_loader.dataset)
+test_acc = test_correct / test_total
+print(f'Test Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}')
+
+# Additional evaluation metrics
+precision = precision_score(all_labels, all_preds, average='weighted')
+recall = recall_score(all_labels, all_preds, average='weighted')
+f1 = f1_score(all_labels, all_preds, average='weighted')
+print(f'Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}')
+
+# A. Confusion matrix
+conf_matrix = confusion_matrix(all_labels, all_preds)
+plt.figure(figsize=(10, 8))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=dataset.class_names, yticklabels=dataset.class_names)
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix')
+plt.show()
+
+def visualize_misclassified_images(loader, model, class_names):
+    model.eval()
+    misclassified_images = []
+    misclassified_labels = []
+    misclassified_preds = []
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            for i in range(len(labels)):
+                if preds[i] != labels[i]:
+                    misclassified_images.append(inputs[i].cpu())
+                    misclassified_labels.append(labels[i].cpu().item())
+                    misclassified_preds.append(preds[i].cpu().item())
+
+    misclassified_images = [transforms.ToPILImage()(img) for img in misclassified_images]
+    return misclassified_images, misclassified_labels, misclassified_preds
+
+misclassified_images, misclassified_labels, misclassified_preds = visualize_misclassified_images(test_loader, model, dataset.class_names)
+
+# Display a few misclassified images
+plt.figure(figsize=(15, 15))
+for i in range(min(10, len(misclassified_images))):
+    plt.subplot(1, 10, i+1)
+    plt.imshow(misclassified_images[i])
+    plt.title(f'T: {dataset.class_names[misclassified_labels[i]]}\nP: {dataset.class_names[misclassified_preds[i]]}')
+    plt.axis('off')
+plt.show()
+
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(train_loss, label='Train Loss')
+plt.plot(val_loss, label='Val Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Learning Curve (Loss)')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(train_acc, label='Train Accuracy')
+plt.plot(val_acc, label='Val Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.title('Learning Curve (Accuracy)')
+plt.legend()
+
+plt.show()
+
+report = classification_report(all_labels, all_preds, target_names=dataset.class_names)
+print(report)
+
+import torch
+import torch.nn as nn
+
+class FeatureExtractor(nn.Module):
+    def __init__(self, model):
+        super(FeatureExtractor, self).__init__()
+        self.model = model
+        self.features = nn.Sequential(*list(model.children())[:-1])
+
+    def forward(self, x):
+        with torch.no_grad():
+            x = self.features(x)
+            x = x.view(x.size(0), -1)
+        return x
+
+import numpy as np
+from sklearn.manifold import TSNE
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import torch
+
+def visualize_tsne(model, test_loader, device):
+    # Create feature extractor model
+    feature_extractor = FeatureExtractor(model).to(device)
+
+    # Collect features and labels
+    features_list = []
+    labels_list = []
+
+    feature_extractor.eval()
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            features = feature_extractor(inputs).cpu().numpy()
+            features_list.append(features)
+            labels_list.append(labels.cpu().numpy())
+
+    # Convert lists to numpy arrays
+    features = np.vstack(features_list)
+    labels = np.concatenate(labels_list)
+
+    # Apply t-SNE
+    tsne = TSNE(n_components=2, random_state=42)
+    tsne_result = tsne.fit_transform(features)
+
+    # Prepare DataFrame for visualization
+    tsne_df = pd.DataFrame(tsne_result, columns=['tsne1', 'tsne2'])
+    tsne_df['label'] = labels
+
+    # Plot t-SNE
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(x='tsne1', y='tsne2', hue='label', palette='viridis', data=tsne_df, legend='full', alpha=0.7)
+    plt.title('t-SNE Visualization of Test Set Features')
+    plt.show()
+
+# Example call to the function
+visualize_tsne(model, test_loader, device)
